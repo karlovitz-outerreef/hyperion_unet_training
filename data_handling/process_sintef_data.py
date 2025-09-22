@@ -21,11 +21,15 @@ def main():
     df_dict = {
         'frame_path': [],
         'segm_path': [],
-        'model_dataset': [],
         'source_dataset': [],
         'patient_id': [],
         'raw_path': []
     }
+
+    # keep track of files saved in each data set
+    num_train = 0
+    num_val = 0
+    num_test = 0
 
     # loop through and find all .mhd files under PREFIX
     for page in page_iterator:
@@ -44,34 +48,29 @@ def main():
                     basename[:-3] + '.mhd'
                 )
 
-                # form new paths
-                frame_path = os.path.join(
-                    'data/processed/SintefData/images',
-                    '_'.join(dirname.split('/')[3:])
-                ) + '_' + basename[:-3] + '.npy'
-                segm_path = os.path.join(
-                    'data/processed/SintefData/labels',
-                    '_'.join(dirname.split('/')[3:])
-                ) + '_' + basename[:-3] + '.npy'
-
                 # Patient folder = immediate child under SintefData
                 patient_id = key.split("/")[3]
 
-                # for Sintef data
+                # form new paths based on data set; for Sintef data
                 #   patients 1-7 -> train
                 #   patient 8 -> val
                 #   patient 9-10 -> test
                 if int(patient_id) <= 7:
-                    model_ds = 'train'
+                    frame_path = f'data/processed/train/images/SintefData_{num_train:03}.npy'
+                    segm_path = f'data/processed/train/labels/SintefData_{num_train:03}.npy'
+                    num_train += 1
                 elif int(patient_id) == 8:
-                    model_ds = 'val'
+                    frame_path = f'data/processed/val/images/SintefData_{num_val:03}.npy'
+                    segm_path = f'data/processed/val/labels/SintefData_{num_val:03}.npy'
+                    num_val += 1
                 else:
-                    model_ds = 'test'
+                    frame_path = f'data/processed/test/images/SintefData_{num_test:03}.npy'
+                    segm_path = f'data/processed/test/labels/SintefData_{num_test:03}.npy'
+                    num_test += 1
 
                 # add to dict
                 df_dict['frame_path'].append(frame_path)
                 df_dict['segm_path'].append(segm_path)
-                df_dict['model_dataset'].append(model_ds)
                 df_dict['source_dataset'].append('SintefData')
                 df_dict['patient_id'].append(patient_id)
                 df_dict['raw_path'].append(frame_mhd)
@@ -87,5 +86,5 @@ def main():
     append_df_to_s3_csv(df, BUCKET, 'data/processed/manifest.csv')
 
 
-if __name__ == '__main__' :
+if __name__ == '__main__':
     main()
