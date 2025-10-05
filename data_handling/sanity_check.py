@@ -10,9 +10,8 @@ FRAME_COL = "frame_path"
 SEGM_COL = "segm_path"
 
 # ---- patient-level split consistency check ----
-SRC_COL   = "source_dataset"
-PID_COL   = "patient_id"
-MODEL_COL = "model_dataset"
+SRC_COL = "source_dataset"
+PID_COL = "patient_id"
 
 s3 = boto3.client("s3")
 
@@ -45,20 +44,21 @@ def s3_exists(bucket: str, key: str) -> bool:
 def check_patient_split_consistency(df: pd.DataFrame,
                                     src_col: str = SRC_COL,
                                     pid_col: str = PID_COL,
-                                    model_col: str = MODEL_COL):
+                                    frame_col: str = FRAME_COL):
     """
     Ensures that for each (source_dataset, patient_id) pair, the model_dataset
     is the same across all rows. Flags groups with >1 unique non-null labels,
     and groups where model_dataset is entirely missing (all null).
     """
+
     # Work only on the three relevant columns
-    sub = df[[src_col, pid_col, model_col]].copy()
+    sub = df[[src_col, pid_col, frame_col]].copy()
 
     # Normalize labels (strip whitespace, lower) & keep NaN as NaN
-    sub[model_col] = sub[model_col].astype("string").str.strip().str.lower()
+    sub["model_dataset"] = sub[frame_col].str.split("/").str.get(2)
 
     # Group by (source_dataset, patient_id)
-    g = sub.groupby([src_col, pid_col])[model_col]
+    g = sub.groupby([src_col, pid_col])["model_dataset"]
 
     # Unique non-null labels per group
     unique_labels = g.apply(lambda s: sorted({x for x in s.dropna()})).rename("unique_labels")
