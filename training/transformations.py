@@ -51,7 +51,7 @@ def label2input(arr, inp_size=(512, 512)):
 # Data Augmentations #
 ######################
 
-def default_augmentations(inp_size=(512, 512)):
+def augment_from_config(inp_size=(512, 512)):
 
     # adds channel dimension
     add_channels = A.Lambda(
@@ -89,7 +89,27 @@ def default_augmentations(inp_size=(512, 512)):
             elastic,
             speckle,
 
-            # Convert to tensors last
+            # Convert from uint8 to float32 and tensor
+            A.Normalize(mean=(0.0,), std=(1.0,), max_pixel_value=255.0),
+            ToTensorV2(transpose_mask=True),
+        ],
+        # IMPORTANT: this tells Albumentations that "label" is a mask so it uses nearest-neighbor interp
+        additional_targets={'label': 'mask'},
+    )
+
+def default_augmentation(inp_size=(512, 512)) :
+    # adds channel dimension
+    add_channels = A.Lambda(
+        image=lambda x, **kwargs: x[..., np.newaxis]
+    )
+
+    return A.Compose(
+        [
+            add_channels,
+            A.Resize(inp_size[0], inp_size[1], interpolation=cv2.INTER_LINEAR, p=1.0),
+
+            # Convert from uint8 to float32 and tensor
+            A.Normalize(mean=(0.0,), std=(1.0,), max_pixel_value=255.0),
             ToTensorV2(transpose_mask=True),
         ],
         # IMPORTANT: this tells Albumentations that "label" is a mask so it uses nearest-neighbor interp
