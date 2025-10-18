@@ -4,10 +4,12 @@ from pathlib import Path
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from datasets import Dir2Dataset  # assumes PYTHONPATH includes your package
 from transformations import augment_from_config, default_augmentation
+from unet import UNet
 
 # --------------------------
 # Helpers
@@ -56,11 +58,33 @@ def load_checkpoint_if_exists(model: nn.Module, optimizer: torch.optim.Optimizer
     return 0, None
 
 
-def dice_loss(pred_logits, target, eps=1e-6):
-    pred = torch.sigmoid(pred_logits)
-    num = 2.0 * (pred * target).sum([1,2])
-    den = (pred + target).sum([1,2]) + eps
-    return 1.0 - (num / den).mean()
+def dice_loss_from_logits(
+    logits: torch.Tensor,        # (B, 2, H, W)
+    target: torch.Tensor,        # (B, H, W) with {0,1}
+    eps: float = 1e-6,
+    fg_class: int = 1,
+    ignore_index: int | None = None,
+    reduce: str = "mean",
+):
+    # probs for foreground
+    probs = F.softmax(logits, dim=1)[:, fg_class, ...]  # (B,H,W)
+
+    # build mask (optionally ignore pixels)
+    if ignore_index is not None:
+        valid = (target != ignore_index)
+        tgt_fg = (target == fg_class) & valid
+        probs = probs * valid.float()
+    else:
+        tgt_fg = (target == fg_class)
+
+    tgt_fg = tgt_fg.float()
+
+    dims = tuple(range(1, probs.dim()))
+    intersection = (probs * tgt_fg).sum(dim=dims)
+    denominator  = (probs + tgt_fg).sum(dim=dims).clamp_min(eps)
+    dice = (2.0 * intersection + eps) / (denominator + eps)
+    loss = 1.0 - dice
+    return loss.mean() if reduce == "mean" else loss
 
 
 # --------------------------
@@ -85,16 +109,17 @@ def make_loader(ds, batch_size: int, shuffle: bool, num_workers: int):
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
     model.eval()
-    running = {"dice": 0.0, "bce": 0.0}
-    loss_bce = nn.BCEWithLogitsLoss()
+    running = {"dice": 0.0, "ce": 0.0}
+    loss_ce = nn.CrossEntropyLoss(torch.Tensor([1.0, 5.0]))
     n = 0
     for xb, yb in loader:
-        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True).float()
-        logits = model(xb)[:, 1, ...]
-        bce = loss_bce(logits, yb)
-        d = dice_loss(logits, yb)
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True).long()
+        logits = model(xb)
+        ce = loss_ce(logits, yb)
+        d = dice_loss_from_logits(logits, yb)
         running["dice"] += (1.0 - d).item() * xb.size(0)  # report Dice score
-        running["bce"]  += bce.item() * xb.size(0)
+        running["ce"]  += ce.item() * xb.size(0)
         n += xb.size(0)
     for k in running:
         running[k] /= max(1, n)
@@ -102,21 +127,22 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
 
 def train_one_epoch(model, loader, device, optimizer, scaler=None):
     model.train()
-    loss_bce = nn.BCEWithLogitsLoss()
-    running = {"dice": 0.0, "bce": 0.0}
+    loss_ce = nn.CrossEntropyLoss(torch.Tensor([1.0, 5.0]))
+    running = {"dice": 0.0, "ce": 0.0}
     n = 0
     for xb, yb in loader:
-        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True).float()
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True).long()
         optimizer.zero_grad(set_to_none=True)
-        logits = model(xb)[:, 1, ...]
-        bce = loss_bce(logits, yb)
-        d = dice_loss(logits, yb)
-        loss = bce + d
+        logits = model(xb)
+        ce = loss_ce(logits, yb)
+        d = dice_loss_from_logits(logits, yb)
+        loss = ce + d
         loss.backward()
         optimizer.step()
 
         running["dice"] += (1.0 - d).item() * xb.size(0)
-        running["bce"]  += bce.item() * xb.size(0)
+        running["ce"]  += ce.item() * xb.size(0)
         n += xb.size(0)
     for k in running:
         running[k] /= max(1, n)
@@ -134,7 +160,7 @@ def parse_args():
     p.add_argument("--images-path", type=str, default="images")
     p.add_argument("--labels-path", type=str, default="labels")
     p.add_argument("--model-dir", type=str, default=os.environ.get("SM_MODEL_DIR", "./outputs"))
-    p.add_argument("--model-filename", type=str, default=None)
+    p.add_argument("--config-file", type=str, default=None)
     # HParams
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=8)
@@ -163,7 +189,7 @@ def main():
         root=train_root,
         images_path=args.images_path,
         labels_path=args.labels_path,
-        augment=default_augmentation(),                 # TODO: add Albumentations pipeline
+        augment=augment_from_config(args.config_file),
         return_paths=False,
     )
     val_ds = Dir2Dataset(
@@ -177,10 +203,12 @@ def main():
     val_loader   = make_loader(val_ds,   args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # Model/Opt
-    model = torch.jit.load(
-        os.path.join(model_dir, args.model_filename),
-        map_location=device
-    ).eval()
+    model = UNet(
+        in_ch=1, num_classes=2,
+        enc=(32, 32, 64, 128, 128, 128),
+        dec=(128, 128, 64, 32, 16),
+        p_drop=0.5
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Resume if requested
@@ -199,15 +227,15 @@ def main():
         dt = time.time() - t0
 
         print(f"epoch {epoch:03d} | "
-              f"train dice={train_metrics['dice']:.4f} bce={train_metrics['bce']:.4f} | "
-              f"val dice={val_metrics['dice']:.4f} bce={val_metrics['bce']:.4f} | "
+              f"train dice={train_metrics['dice']:.4f} ce={train_metrics['ce']:.4f} | "
+              f"val dice={val_metrics['dice']:.4f} ce={val_metrics['ce']:.4f} | "
               f"{dt:.1f}s")
 
         # TB scalars
         writer.add_scalar("train/dice", train_metrics["dice"], epoch)
-        writer.add_scalar("train/bce",  train_metrics["bce"], epoch)
+        writer.add_scalar("train/ce",  train_metrics["ce"], epoch)
         writer.add_scalar("val/dice",   val_metrics["dice"], epoch)
-        writer.add_scalar("val/bce",    val_metrics["bce"], epoch)
+        writer.add_scalar("val/ce",    val_metrics["ce"], epoch)
 
         # Save (keep best by val dice)
         cur = val_metrics["dice"]

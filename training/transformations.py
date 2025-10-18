@@ -1,3 +1,4 @@
+import json
 import torch
 import numpy as np
 from scipy import ndimage
@@ -51,53 +52,68 @@ def label2input(arr, inp_size=(512, 512)):
 # Data Augmentations #
 ######################
 
-def augment_from_config(inp_size=(512, 512)):
+def augment_from_config(config_path: str):
+    """Load augmentation parameters from a JSON config and build an Albumentations Compose."""
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
 
-    # adds channel dimension
+    inp_size = tuple(cfg["input_size"])
+
+    # Adds channel dimension
     add_channels = A.Lambda(
         image=lambda x, **kwargs: x[..., np.newaxis]
     )
 
-    # elastic deformation
+    # Elastic deformation
+    elastic_cfg = cfg["elastic"]
     elastic = A.ElasticTransform(
-        alpha=20,           # intensity of deformation
-        sigma=6,            # smoothing of displacement
-        alpha_affine=10,    # optional affine component
-        interpolation=1,    # cv2.INTER_LINEAR for images
-        p=0.5
+        alpha=elastic_cfg["alpha"],
+        sigma=elastic_cfg["sigma"],
+        interpolation=getattr(cv2, elastic_cfg["interpolation"]),
+        p=elastic_cfg["p"]
     )
 
-    # speckle
+    # Speckle noise
+    speckle_cfg = cfg["speckle"]
     speckle = A.MultiplicativeNoise(
-        multiplier=(0.9, 1.1),  # multiplicative range
-        elementwise=True,       # vary pixel-by-pixel (speckle-like)
-        p=0.5
+        multiplier=tuple(speckle_cfg["multiplier"]),
+        elementwise=speckle_cfg["elementwise"],
+        p=speckle_cfg["p"]
     )
 
+    # Compose the full augmentation pipeline
     return A.Compose(
         [
             add_channels,
-            A.Resize(inp_size[0], inp_size[1], interpolation=cv2.INTER_LINEAR, p=1.0),
-            A.HorizontalFlip(p=0.5),
-
-            # Mild geometry + photometrics
-            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10,
-                               border_mode=0, value=0, mask_value=0, interpolation=0, p=0.5),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-
-            # elastic deformations and speckle
+            A.Resize(inp_size[0], inp_size[1],
+                     interpolation=getattr(cv2, cfg["resize"]["interpolation"]),
+                     p=cfg["resize"]["p"]),
+            A.HorizontalFlip(p=cfg["horizontal_flip"]["p"]),
+            A.ShiftScaleRotate(
+                shift_limit=cfg["ssr"]["shift_limit"],
+                scale_limit=cfg["ssr"]["scale_limit"],
+                rotate_limit=cfg["ssr"]["rotate_limit"],
+                border_mode=cfg["ssr"]["border_mode"],
+                interpolation=cfg["ssr"]["interpolation"],
+                p=cfg["ssr"]["p"]
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=cfg["brightness_contrast"]["brightness_limit"],
+                contrast_limit=cfg["brightness_contrast"]["contrast_limit"],
+                p=cfg["brightness_contrast"]["p"]
+            ),
             elastic,
             speckle,
-
-            # Convert from uint8 to float32 and tensor
-            A.Normalize(mean=(0.0,), std=(1.0,), max_pixel_value=255.0),
-            ToTensorV2(transpose_mask=True),
+            A.Normalize(mean=tuple(cfg["normalize"]["mean"]),
+                        std=tuple(cfg["normalize"]["std"]),
+                        max_pixel_value=cfg["normalize"]["max_pixel_value"]),
+            ToTensorV2(transpose_mask=cfg["to_tensor"]["transpose_mask"]),
         ],
-        # IMPORTANT: this tells Albumentations that "label" is a mask so it uses nearest-neighbor interp
-        additional_targets={'label': 'mask'},
+        additional_targets=cfg["additional_targets"]
     )
 
-def default_augmentation(inp_size=(512, 512)) :
+
+def default_augmentation(inp_size=(512, 512)):
     # adds channel dimension
     add_channels = A.Lambda(
         image=lambda x, **kwargs: x[..., np.newaxis]
