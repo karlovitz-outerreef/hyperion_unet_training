@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os, json, math, argparse, time, warnings, random
 from pathlib import Path
+from datetime import datetime
 
 import torch
 from torch import nn
@@ -58,6 +59,48 @@ def load_checkpoint_if_exists(model: nn.Module, optimizer: torch.optim.Optimizer
     return 0, None
 
 
+def save_job_comment(comment: str, hparams: dict, best_val_dice: float):
+    """Save job comment and metadata to S3 experiment log."""
+    try:
+        import boto3
+        from io import StringIO
+
+        s3 = boto3.client('s3')
+        bucket = 'vessel-segmentation-data'
+        key = 'experiments/training_log.txt'
+
+        # Get job name from environment or use timestamp
+        job_name = os.environ.get('TRAINING_JOB_NAME', f"local-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        # Create log entry
+        log_entry = f"\n{'='*80}\n"
+        log_entry += f"Job: {job_name}\n"
+        log_entry += f"Timestamp: {timestamp}\n"
+        log_entry += f"Comment: {comment}\n"
+        log_entry += f"Best Val Dice: {best_val_dice:.4f}\n"
+        log_entry += f"Hyperparameters:\n"
+        for key_name, value in sorted(hparams.items()):
+            if key_name not in ['job_comment']:  # Don't duplicate comment
+                log_entry += f"  {key_name}: {value}\n"
+        log_entry += f"{'='*80}\n"
+
+        # Try to append to existing log, or create new
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            existing = obj['Body'].read().decode('utf-8')
+            new_content = existing + log_entry
+        except s3.exceptions.NoSuchKey:
+            new_content = "Training Job Log\n" + "="*80 + log_entry
+
+        # Upload updated log
+        s3.put_object(Bucket=bucket, Key=key, Body=new_content, ContentType='text/plain')
+        print(f"[Job comment saved to s3://{bucket}/{key}]")
+
+    except Exception as e:
+        print(f"[Warning] Could not save job comment to S3: {e}")
+
+
 def dice_loss_from_logits(
     logits: torch.Tensor,        # (B, 2, H, W)
     target: torch.Tensor,        # (B, H, W) with {0,1}
@@ -110,7 +153,7 @@ def make_loader(ds, batch_size: int, shuffle: bool, num_workers: int):
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
     model.eval()
     running = {"dice": 0.0, "ce": 0.0}
-    loss_ce = nn.CrossEntropyLoss(torch.Tensor([1.0, 5.0]))
+    loss_ce = nn.CrossEntropyLoss(torch.Tensor([1.0, 5.0]).to(device))
     n = 0
     for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)
@@ -127,7 +170,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
 
 def train_one_epoch(model, loader, device, optimizer, scaler=None):
     model.train()
-    loss_ce = nn.CrossEntropyLoss(torch.Tensor([1.0, 5.0]))
+    loss_ce = nn.CrossEntropyLoss(torch.Tensor([1.0, 5.0]).to(device))
     running = {"dice": 0.0, "ce": 0.0}
     n = 0
     for xb, yb in loader:
@@ -170,7 +213,12 @@ def parse_args():
     # Misc
     p.add_argument("--logdir", type=str, default="./runs")
     p.add_argument("--resume", action="store_true")
-    return p.parse_args()
+    p.add_argument("--job-comment", type=str, default=None, help="Optional comment about this training run")
+    # Parse known args only (ignore SageMaker-injected args)
+    args, unknown = p.parse_known_args()
+    if unknown:
+        print(f"[Warning] Ignoring unknown arguments: {unknown}")
+    return args
 
 def main():
     args = parse_args()
@@ -180,16 +228,34 @@ def main():
     val_root   = resolve_data_dir(args.val_dir,   "SM_CHANNEL_VAL", default=train_root)
     model_dir  = args.model_dir
 
+    # Handle config file from SageMaker channel (if it's a directory, look for config inside)
+    config_file = args.config_file
+    if not config_file:
+        # Try to get from SageMaker environment
+        config_file = os.environ.get("SM_CHANNEL_CONFIG")
+
+    if config_file and os.path.isdir(config_file):
+        # SageMaker downloads single-file channels to a directory
+        config_file = os.path.join(config_file, 'default_config.json')
+
+    if not config_file:
+        raise ValueError("Must provide --config-file or set SM_CHANNEL_CONFIG environment variable")
+
     seed_everything(args.seed)
     device = default_device()
+
     print(f"[device] {device}")
+    print(f"[train_root] {train_root}")
+    print(f"[val_root] {val_root}")
+    print(f"[model_dir] {model_dir}")
+    print(f"[config_file] {config_file}")
 
     # Datasets/Loaders
     train_ds = Dir2Dataset(
         root=train_root,
         images_path=args.images_path,
         labels_path=args.labels_path,
-        augment=augment_from_config(args.config_file),
+        augment=augment_from_config(config_file),
         return_paths=False,
     )
     val_ds = Dir2Dataset(
@@ -209,6 +275,8 @@ def main():
         dec=(128, 128, 64, 32, 16),
         p_drop=0.5
     )
+    model = model.to(device)
+    print(f"[model] moved to {device}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Resume if requested
@@ -251,6 +319,10 @@ def main():
     torch.save(model.state_dict(), Path(model_dir) / "model_final.pt")
     with open(Path(model_dir) / "metrics.json", "w") as f:
         json.dump({"best_val_dice": best_val}, f)
+
+    # Save job comment if provided
+    if args.job_comment:
+        save_job_comment(args.job_comment, vars(args), best_val)
 
     writer.close()
 

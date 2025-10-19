@@ -1,0 +1,54 @@
+{
+  "input_size": [512, 512],
+
+  "resize": {
+    "interpolation": "INTER_LINEAR",
+    "p": 1.0
+  },
+
+  "horizontal_flip": {
+    "p": 0.5
+  },
+
+  "ssr": {
+    "shift_limit": 0.1,
+    "scale_limit": 0.2,
+    "rotate_limit": 15,
+    "border_mode": 0,
+    "interpolation": 1,
+    "p": 0.7
+  },
+
+  "brightness_contrast": {
+    "brightness_limit": 0.2,
+    "contrast_limit": 0.2,
+    "p": 0.5
+  },
+
+  "elastic": {
+    "alpha": 50,
+    "sigma": 5,
+    "interpolation": "INTER_LINEAR",
+    "p": 0.3
+  },
+
+  "speckle": {
+    "multiplier": [0.9, 1.1],
+    "elementwise": true,
+    "p": 0.5
+  },
+
+  "normalize": {
+    "mean": [0.0],
+    "std": [1.0],
+    "max_pixel_value": 255.0
+  },
+
+  "to_tensor": {
+    "transpose_mask": true
+  },
+
+  "additional_targets": {
+    "label": "mask"
+  }
+}

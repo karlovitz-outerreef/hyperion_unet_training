@@ -34,7 +34,7 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_ch, out_ch, p_drop=0.0):
         super().__init__()
-        # Match names: (up) UpsamplingNearest2d, (conv) ConvBlock
+        # Nearest neighbor upsampling (can be changed to 'bilinear' if needed)
         self.up = nn.Upsample(scale_factor=2, mode='nearest')
         self.conv = ConvBlock(in_ch, out_ch, p_drop)
 
